@@ -1,1 +1,255 @@
+import requests
+import os
+import shutil
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+import tkinter as tk
+from tkinter import messagebox, scrolledtext
+import logging
+import threading
+from selenium import webdriver
+import time
 
+class URLScanner:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("URL Scanner")
+        self.attempted_urls = []
+        self.all_collected_urls = {}  # Store URLs with their titles
+        self.is_scanning = False
+        self.scan_thread = None
+        self.base_domain = ""
+        self.relevant_tags = ['a', 'video']  # Tags to check for
+        self.download_folder = "downloaded_pages"  # Folder to save downloaded HTML files
+
+        # Create URL entry
+        self.url_entry = tk.Entry(master, width=50)
+        self.url_entry.pack(pady=10)
+
+        # Create scan and settings buttons
+        self.scan_button = tk.Button(master, text="Scan URL", command=self.start_scan)
+        self.scan_button.pack(pady=10)
+
+        self.cancel_button = tk.Button(master, text="Cancel Scan", command=self.cancel_scan)
+        self.cancel_button.pack(pady=10)
+
+        self.settings_button = tk.Button(master, text="Settings", command=self.show_settings)
+        self.settings_button.pack(pady=10)
+
+        # Create a listbox to display collected URLs with titles
+        self.source_listbox = tk.Listbox(master, width=80, height=15)
+        self.source_listbox.pack(pady=10)
+
+        # Button to download selected link
+        self.download_button = tk.Button(master, text="Download Selected Link", command=self.download_selected_link)
+        self.download_button.pack(pady=10)
+
+        # Button to open selected HTML in Selenium
+        self.open_html_button = tk.Button(master, text="Open HTML in Browser", command=self.open_selected_html)
+        self.open_html_button.pack(pady=10)
+
+    def start_scan(self):
+        url = self.url_entry.get()
+        if not url:
+            messagebox.showwarning("Input Error", "Please enter a URL to scan.")
+            return
+
+        self.attempted_urls = []
+        self.all_collected_urls = {}  # Reset at the start of a new scan
+        self.is_scanning = True
+        self.base_domain = urlparse(url).netloc  # Extract base domain for relevance checking
+
+        # Create the download folder if it does not exist
+        if os.path.exists(self.download_folder):
+            shutil.rmtree(self.download_folder)  # Clear old files
+        os.makedirs(self.download_folder)
+
+        # Start the scan in a separate thread
+        self.scan_thread = threading.Thread(target=self.collect_urls, args=(url, 1))
+        self.scan_thread.start()
+
+    def cancel_scan(self):
+        self.is_scanning = False
+        messagebox.showinfo("Scan Cancelled", "The scanning operation has been cancelled. You can check the collected links in settings.")
+        self.display_scanned_urls()  # Perform any cleanup if necessary
+
+    def display_scanned_urls(self):
+        if self.all_collected_urls:
+            scanned_urls = "\n".join([f"{title}: {url}" for url, title in self.all_collected_urls.items()])
+            messagebox.showinfo("Scanned URLs", f"Scanned URLs:\n{scanned_urls}")
+        else:
+            messagebox.showinfo("No URLs", "No relevant URLs were scanned.")
+
+    def show_settings(self):
+        settings_window = tk.Toplevel(self.master)
+        settings_window.title("Collected Links")
+
+        # Create a scrolled text widget to display all collected links
+        text_area = scrolledtext.ScrolledText(settings_window, width=80, height=20)
+        text_area.pack(pady=10)
+
+        if self.all_collected_urls:
+            for url, title in self.all_collected_urls.items():
+                text_area.insert(tk.END, f"{title}: {url}\n")
+        else:
+            text_area.insert(tk.END, "No URLs have been collected yet.")
+
+    def download_selected_link(self):
+        selected_index = self.source_listbox.curselection()
+        if not selected_index:
+            messagebox.showwarning("Selection Error", "Please select a link to download.")
+            return
+
+        # Get the corresponding URL
+        url_to_download = list(self.all_collected_urls.keys())[selected_index[0]]
+        output_file_name = os.path.join(self.download_folder, f"{self.sanitize_filename(url_to_download)}.html")
+        self.download_file(url_to_download, output_file_name)
+
+    @staticmethod
+    def sanitize_filename(url: str) -> str:
+        # Sanitize URL to create a valid filename
+        return "".join(c for c in url if c.isalnum() or c in (' ', '-', '_')).rstrip()
+
+    def open_selected_html(self):
+        selected_index = self.source_listbox.curselection()
+        if not selected_index:
+            messagebox.showwarning("Selection Error", "Please select a link to view.")
+            return
+
+        url_to_download = list(self.all_collected_urls.keys())[selected_index[0]]
+        output_file_name = os.path.join(self.download_folder, f"{self.sanitize_filename(url_to_download)}.html")
+        
+        if os.path.exists(output_file_name):
+            driver = webdriver.Chrome()  # Ensure you have Chromedriver installed
+            driver.get(f"file:///{os.path.abspath(output_file_name)}")  # Open the HTML file with Selenium
+        else:
+            messagebox.showerror("File Error", "Downloaded HTML file does not exist.")
+
+    def download_file(self, link: str, output_file_path: str):
+        try:
+            # Fetching HTML content of the page
+            response = requests.get(link)
+            response.raise_for_status()  # Raise an error for bad responses
+            
+            # Create a directory for saving assets related to this page
+            asset_folder = os.path.join(self.download_folder, self.sanitize_filename(link))
+            os.makedirs(asset_folder, exist_ok=True)
+
+            # Save the HTML content to an HTML file
+            with open(output_file_path, 'w', encoding='utf-8') as file:
+                # Parse assets
+                soup = BeautifulSoup(response.content, 'html.parser')
+
+                # Find all images, videos, and links to stylesheets
+                for img in soup.find_all('img'):
+                    img_src = img.get('src')
+                    if img_src:
+                        img_url = urljoin(link, img_src)
+                        self.download_asset(img_url, asset_folder)
+
+                for video in soup.find_all('video'):
+                    for source in video.find_all('source'):
+                        video_src = source.get('src')
+                        if video_src:
+                            video_url = urljoin(link, video_src)
+                            video_filename = self.download_video(video_url, asset_folder)
+                            if video_filename:
+                                source['src'] = f"./{self.sanitize_filename(link)}/{video_filename}"
+
+                for css_link in soup.find_all('link', href=True):
+                    css_url = urljoin(link, css_link['href'])
+                    self.download_asset(css_url, asset_folder)
+
+                # Update all 'src' and 'href' to have the correct local paths
+                for img in soup.find_all('img'):
+                    img_src = img.get('src')
+                    if img_src:
+                        img_filename = self.sanitize_filename(img_src)
+                        img['src'] = f"./{self.sanitize_filename(link)}/{img_filename}"  # Fix img path
+
+                # Write modified HTML to file
+                file.write(str(soup))
+                
+            messagebox.showinfo("Success", f"Downloaded {output_file_path} for offline viewing")
+        except Exception as e:
+            logging.error(f"Failed to download {link} - Error: {e}")
+            messagebox.showerror("Download Error", f"Failed to download {link}")
+
+    def download_video(self, video_url: str, asset_folder: str):
+        try:
+            video_response = requests.get(video_url)
+            video_response.raise_for_status()  # Raise an error for bad responses
+            
+            video_filename = os.path.join(asset_folder, os.path.basename(video_url))
+            with open(video_filename, 'wb') as video_file:
+                video_file.write(video_response.content)
+            return os.path.basename(video_url)  # Return just the filename
+        except Exception as e:
+            logging.error(f"Failed to download video {video_url} - Error: {e}")
+            return None
+
+    def download_asset(self, asset_url: str, asset_folder: str):
+        try:
+            asset_response = requests.get(asset_url)
+            asset_response.raise_for_status()  # Raise an error for bad responses
+            
+            asset_filename = os.path.join(asset_folder, os.path.basename(asset_url))
+            with open(asset_filename, 'wb') as asset_file:
+                asset_file.write(asset_response.content)
+        except Exception as e:
+            logging.error(f"Failed to download asset {asset_url} - Error: {e}")
+
+    def collect_urls(self, url, depth):
+        if depth > 5 or url in self.attempted_urls or not self.is_scanning:  # Limit depth to 5
+            return
+        
+        self.attempted_urls.append(url)
+
+        try:
+            # Use Selenium to fetch the page
+            driver = webdriver.Chrome()  # Ensure you have Chromedriver installed
+            driver.get(url)
+            time.sleep(2)  # Wait for the page to load
+            
+            # Get the page source from Selenium
+            page_source = driver.page_source
+            driver.quit()
+
+            # Parse the page source with BeautifulSoup
+            soup = BeautifulSoup(page_source, 'html.parser')
+
+            # Collect relevant headings and titles from the page
+            page_title = soup.title.string.strip() if soup.title and soup.title.string else "No Title"
+            relevant_urls = {}
+            for tag in self.relevant_tags:
+                for link in soup.find_all(tag, href=True):
+                    link_url = urljoin(url, link.get('href'))
+                    if urlparse(link_url).netloc == self.base_domain:  # Same domain check
+                        relevant_urls[link_url] = page_title  # Store with URL
+
+            # Store the collected URLs with their titles
+            self.all_collected_urls.update(relevant_urls)
+
+            # Update the listbox with collected URLs
+            self.source_listbox.delete(0, tk.END)
+            for collected_url, title in self.all_collected_urls.items():
+                self.source_listbox.insert(tk.END, f"{collected_url}: {title}")
+
+            # Recursively collect URLs from found links
+            for collected_url in relevant_urls.keys():
+                self.collect_urls(collected_url, depth + 1)  # Recursive call, increment depth
+
+        except Exception as e:
+            logging.error(f"Failed to scan the URL: {url} - Error: {e}")
+
+        if not self.is_scanning:
+            self.display_scanned_urls()  # Show scanned URLs if canceled
+        elif depth == 1:
+            messagebox.showinfo("Scan Complete", "Scanning completed!")
+            self.display_scanned_urls()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.ERROR)
+    root = tk.Tk()
+    app = URLScanner(root)
+    root.mainloop()
